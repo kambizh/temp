@@ -1,0 +1,146 @@
+@Component
+@DependsOn({"bifrostKubernetesNamespaceConfiguration"})
+public class BifrostControllerManager implements Controller {
+    @Generated
+    private static final Logger log = LoggerFactory.getLogger(BifrostControllerManager.class);
+    private ExecutorService controllerThreadPool;
+    private final List<BifrostResourceController<? extends IBifrostKubernetesObject, ? extends KubernetesListObject>> controllers = new ArrayList();
+    private final BifrostLeaderElectionConfiguration bifrostLeaderElectionConfiguration;
+    private LeaderElector leaderElector;
+    private volatile boolean isLeader = false;
+
+    public void addController(BifrostResourceController<?, ?> controller) {
+        this.controllers.add(controller);
+    }
+
+    public void run() {
+        if (this.controllers.isEmpty()) {
+            throw new IllegalStateException("No controller registered in the manager");
+        } else {
+            if (this.bifrostLeaderElectionConfiguration.isEnabled()) {
+                log.info("Leader election is enabled, starting leader election process");
+                this.runWithLeaderElection();
+            } else {
+                log.info("Leader election is disabled, starting controllers directly");
+                this.startControllers();
+            }
+
+            log.info("Exiting BifrostControllerManager");
+        }
+    }
+
+    private void runWithLeaderElection() {
+        log.info("Starting controller manager with leader election enabled");
+        String lockIdentity = StringUtils.isBlank(this.bifrostLeaderElectionConfiguration.getLockIdentity()) ? UUID.randomUUID().toString() : this.bifrostLeaderElectionConfiguration.getLockIdentity();
+        String lockName = this.bifrostLeaderElectionConfiguration.getName();
+        log.info("Identified candidate for leader election; lockIdentity={}, name={}", lockIdentity, lockName);
+
+        try {
+            LeaseLock lock = new LeaseLock(this.bifrostLeaderElectionConfiguration.getNamespace(), lockName, lockIdentity);
+            LeaderElectionConfig leaderElectionConfig = new LeaderElectionConfig(lock, Duration.ofMillis(this.bifrostLeaderElectionConfiguration.getLeaseDurationMillis()), Duration.ofMillis(this.bifrostLeaderElectionConfiguration.getRenewDeadlineMillis()), Duration.ofMillis(this.bifrostLeaderElectionConfiguration.getRetryPeriodMillis()));
+            this.leaderElector = new LeaderElector(leaderElectionConfig);
+            this.leaderElector.run(() -> {
+                log.info("Acquired leadership; lockIdentity={}, name={}", lockIdentity, lockName);
+                this.isLeader = true;
+                this.startControllers();
+            }, () -> {
+                log.info("Lost leadership; lockIdentity={}, name={}", lockIdentity, lockName);
+                this.isLeader = false;
+                this.stopControllers();
+            });
+        } catch (Exception e) {
+            log.error("Error in leader election", e);
+            this.shutdown();
+        }
+
+    }
+
+    private void startControllers() {
+        log.info("Starting controllers");
+        Map<String, String> context = MDC.getCopyOfContextMap();
+        CountDownLatch latch = new CountDownLatch(this.controllers.size());
+        this.controllerThreadPool = Executors.newFixedThreadPool(this.controllers.size());
+
+        for(BifrostResourceController<?, ?> controller : this.controllers) {
+            this.controllerThreadPool.submit(() -> {
+                MDC.setContextMap(context);
+                MDC.put("controllerId", "Controller-" + controller.getControllerConfiguration().getName());
+                MDC.put("resource.version", controller.getControllerConfiguration().getApiVersion());
+                MDC.put("resource.kind", controller.getControllerConfiguration().getKind());
+
+                try {
+                    controller.run();
+                } catch (Exception e) {
+                    log.error("Unexpected controller termination", e);
+                } finally {
+                    latch.countDown();
+                    log.debug("Controller has exited");
+                    MDC.clear();
+                }
+
+            });
+        }
+
+        try {
+            log.debug("BifrostControllerManager bootstrapping");
+            latch.await();
+        } catch (InterruptedException e) {
+            log.error("BifrostControllerManager interrupted while waiting for controllers to terminate", e);
+            Thread.currentThread().interrupt();
+        } finally {
+            log.info("Exiting BifrostControllerManager startControllers");
+        }
+
+    }
+
+    void stopControllers() {
+        log.info("Stopping controllers");
+
+        for(BifrostResourceController<?, ?> controller : this.controllers) {
+            controller.shutdown();
+        }
+
+        if (this.controllerThreadPool != null) {
+            log.info("Shutting down controller thread pool");
+            this.controllerThreadPool.shutdown();
+
+            try {
+                if (this.controllerThreadPool.awaitTermination(60L, TimeUnit.SECONDS)) {
+                    this.controllerThreadPool = null;
+                } else {
+                    log.error("Controller thread pool did not terminate");
+                }
+            } catch (InterruptedException e) {
+                log.error("Thread pool termination was interrupted", e);
+                Thread.currentThread().interrupt();
+            }
+        }
+
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        log.info("Shutting down controller manager");
+        this.stopControllers();
+        if (this.leaderElector != null) {
+            try {
+                this.leaderElector.close();
+                this.leaderElector = null;
+                log.debug("Leader elector closed");
+            } catch (Exception e) {
+                log.error("Error closing leader elector", e);
+            }
+        }
+
+        log.info("Controller manager shutdown complete");
+    }
+
+    public boolean isLeader() {
+        return !this.bifrostLeaderElectionConfiguration.isEnabled() || this.isLeader;
+    }
+
+    @Generated
+    public BifrostControllerManager(final BifrostLeaderElectionConfiguration bifrostLeaderElectionConfiguration) {
+        this.bifrostLeaderElectionConfiguration = bifrostLeaderElectionConfiguration;
+    }
+}
