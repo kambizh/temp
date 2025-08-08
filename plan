@@ -1,0 +1,130 @@
+Project Setup
+Perform initial setup:
+Install Talos Linux, deploy the operator, and manually run one stress test end-to-end to understand the full workflow  [  started 29/07/2025 - done 1/07/2027 ]
+Fork or clone skeleton-operator → create 103960-bico-bifrost-stress-operator-service repo  [  ]
+Add StressProvisioner.java with:  [  ]
+createDelaySeconds
+inProgressCompliance async simulation
+Configurable log level
+Validate adapter integration with controller [  ]
+CI Integration
+ Confirm and understand the pipeline.yaml which exists in the repo [  ]
+ Ensure I can run pipeline on branch push to: [  ]
+Build the operator
+Run unit tests
+Generate & publish Docker image
+Pass sonar/security checks
+Test Runner + Scripts
+Refactor/merge resource_spammer.sh and code_spammer.sh [  ]
+Create run_stress_suite.sh to:  [  ]
+Accept scenario YAML file
+Deploy the operator image (with env vars)
+Trigger spammer scripts
+Monitor resource states
+Collect timing and status
+Handle operator crashes : 
+Restart count of test-related pods ( indicate possible OOM or crash )
+Log if any pod died or restarted mid-test
+Save output to results/YYYYMMDD_<scenario>.json
+Support image override: --image  : 103960-bico-bifrost-stress-operator-service:<tag> (must be prebuilt with the desired core library version)
+Scenario Management
+Create scenarios/ folder [  ]
+Define YAML for each test case (For example : rapid-create, async-load, etc.) [  ]
+Add parser logic to runner script [  ]
+VM Setup
+Ensure Talos Linux and Kubernetes are configured [  ]
+Operator can be deployed via kubectl [  ]
+Docker is available [  ] 
+Create directory structure [  ]:
+
+~/stress-tests/
+├── scripts/
+├── scenarios/
+├── deployments/
+├── results/
+
+Access and Documentation
+SSH access available for Bifrost Core team [  ]
+Add Confluence or README documentation for: [  ]
+Running the test suite
+Understanding each scenario
+How to add a new test
+How to interpret results
+Rebuilding the VM ( Mastercard policy is to delete a Dev Cloud VM after 8 months, so we need to rebuild.)
+Result Logging
+Each test logs: [  ]
+Start time, End time
+Number of resources
+Success/failure status
+Errors (if any)
+Append to `results/history.json` or `results.csv` summary
+ETCD storage size at end of test. ( kubectl exec <etcd-pod> -n kube-system – du -sh /var/lib/etcd )
+Final Acceptance Criteria
+Operator supports all test config options [  ]
+Can run full suite via single command [  ] 
+All test results logged [  ] 
+[Team can SSH and run tests independently [  ]
+Clean documentation available [  ]
+Maybe work on Enhancements if we have time 
+Project Setup Improvements
+Enhancement
+Description
+Resource limit testing
+Run tests with increasing memory limits (for example 512Mi → 1024Mi → 2048Mi) to analyze scaling. Actually we want to find the minimum reliable limit.
+Dependency chain simulation
+Create CRs with dependencies (for example : A → B → C) and observe reconciliation flow
+Mixed workload simulation
+Simulate real workloads with a mix: 70% create, 20% update, 10% delete actions
+Enhance Test Runner (`run_stress_suite.sh`)
+Enhancement
+Description
+Pre start checks
+Verify cluster is healthy, Talos is running, and required CRDs exist before test
+Automatic cleanup
+Clear old CRs, logs, and orphaned resources between tests
+Real-time monitoring
+Print status during the run (e.g., “Created 500/1000 resources...”)
+Email/Slack notification
+Notify team on test completion (success/failure) with summary
+Resource usage monitoring
+Log CPU/memory of operator pod during stress tests
+Result Analysis & Reporting
+Enhancement
+Description
+Generate HTML/JSON reports
+Render visual reports for reviews the result.
+Compare Bifrost Core versions
+Track metrics per image tag to detect regressions
+Auto-detect performance issues
+Flag spikes in memory, time, retries
+Export test reports
+Share `.json` or `.html` artifacts via email or link
+Error Handling & Recovery
+Enhancement
+Description
+Retry failed scenarios
+Re-run failed test scenarios or parts of them with exponential backoff
+Cleanup orphaned resources
+Detect and delete stuck CRs, controllers, or finalizers
+Enhanced error logs
+Include namespace, resource name, and stacktrace in failure logs
+Phased Roadmap / Priority
+Phase
+Focus
+Phase 1 (MVP)
+Automate 8 original scenarios with one-click run, basic logging
+Phase 2 (Enhancement)
+Add cluster checks, cleanup, retries, reporting structure
+Phase 3 (Polish)
+Integrate with notifications, version diffs
+Success Metrics to Track
+Metric
+Goal
+Time savings
+Manual test: 6+ hours → Automated: single command
+Reliability
+Tests complete consistently without babysitting
+Coverage
+100% of the original 8 stress scenarios automated
+Usability
+Any team member can SSH in and run tests confidently
