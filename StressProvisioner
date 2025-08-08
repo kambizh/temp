@@ -1,0 +1,81 @@
+@Service
+@EnableAsync
+@Slf4j
+public class StressProvisioner implements Provisionable<BifrostResource> {
+
+	@Value("${stress.silentMode}")
+	private boolean silentMode;
+	@Value("${stress.inProgressReplies}")
+	private int inProgressReplies;
+	@Value("${stress.createDelaySeconds}")
+	private int createDelaySeconds;
+
+	@Override
+	public void create(BifrostResource resourceInstance, BifrostCondition condition) {
+		printAction(resourceInstance, "Creating");
+		updateConditionStatus(condition);
+
+		try {
+			Thread.sleep(createDelaySeconds * 1000L);
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	@Override
+	public void update(BifrostResource resourceInstance, BifrostCondition condition) {
+		printAction(resourceInstance, "Updating");
+		updateConditionStatus(condition);
+	}
+
+	@Override
+	public void delete(BifrostResource resourceInstance, BifrostCondition condition) {
+		printAction(resourceInstance, "Deleting");
+		updateConditionStatus(condition);
+	}
+
+	@Override
+	public void updateProvisioningCondition(BifrostResource resourceInstance, BifrostCondition condition) {
+		updateConditionStatus(condition);
+	}
+
+	@Override
+	public String getJsonOutput(BifrostResource resourceInstance, BifrostCondition condition) {
+		JsonElement nameElement = resourceInstance.getSpec().get("name");
+		if (nameElement == null) {
+			return "{}";
+		}
+		return "{\"nameHash\": \"" + DigestUtils.sha256Hex(resourceInstance.getSpec().get("name").getAsString()) + "\"}";
+	}
+
+	@Override
+	public boolean hasDrifted(BifrostResource resourceInstance) {
+		return false;
+	}
+
+	private void printAction(BifrostResource resourceInstance, String action) {
+		if (silentMode) {
+			return;
+		}
+
+		System.out.println("\n\n" + action + " this thing. Its metadata name is " + resourceInstance.getMetadata().getName());
+		System.out.println("Its spec name is...");
+		if (resourceInstance.getSpec().get("name") == null) {
+			System.out.println("Oh no, it's missing.");
+		} else {
+			System.out.println(resourceInstance.getSpec().get("name").getAsString());
+		}
+		System.out.println("\n\n");
+	}
+
+	private void updateConditionStatus(BifrostCondition condition) {
+		int inProgressCount = Integer.parseInt(condition.getMetadata().computeIfAbsent("inProgressCount", c -> "0"));
+
+		if (inProgressCount >= inProgressReplies) {
+			condition.setStatus(BifrostConditionStatus.SUCCEEDED);
+		} else {
+			condition.setStatus(BifrostConditionStatus.IN_PROGRESS);
+			condition.getMetadata().put("inProgressCount", String.valueOf(inProgressCount + 1));
+		}
+	}
+}
