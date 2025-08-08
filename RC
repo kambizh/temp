@@ -1,0 +1,315 @@
+public class BifrostResourceController<T extends IBifrostKubernetesObject, L extends KubernetesListObject> implements Controller {
+    @Generated
+    private static final Logger log = LoggerFactory.getLogger(BifrostResourceController.class);
+    private static final String RESOURCE_NAME = "resource.name";
+    private final IBifrostControllerConfiguration<T, L> controllerConfiguration;
+    private final BifrostControllerProperties controllerProperties;
+    private final GenericKubernetesApi<T, L> genericKubernetesApi;
+    private final CustomObjectsApi customObjectsApi;
+    private final CoreV1Api coreV1Api;
+    private final BifrostKubernetesApiProxy bifrostKubernetesApiProxy;
+    private final BifrostReconciler<T, L> reconciler;
+    private final Thread operationGeneratorThread;
+    private volatile boolean running = true;
+
+    public BifrostResourceController(Provisionable<T> provisioningService, BifrostControllerConfiguration<T, L> controllerConfiguration, BifrostControllerProperties controllerProperties, BifrostResourceControllerDependencies controllerDependencies) {
+        this.controllerConfiguration = controllerConfiguration;
+        this.controllerProperties = controllerProperties;
+        BifrostKubernetesApiManager bifrostKubernetesApiManager = controllerDependencies.getBifrostKubernetesApiManager();
+        this.bifrostKubernetesApiProxy = controllerDependencies.getBifrostKubernetesApiProxy();
+        this.genericKubernetesApi = bifrostKubernetesApiManager.getGenericKubernetesApi(controllerConfiguration.getResourceClass(), controllerConfiguration.getResourceListClass(), controllerConfiguration.getApiGroup(), controllerConfiguration.getApiVersion(), controllerConfiguration.getResourcePlural());
+        this.customObjectsApi = bifrostKubernetesApiManager.getCustomObjectsApi();
+        this.coreV1Api = bifrostKubernetesApiManager.getCoreV1Api();
+        BifrostDependencyHandler bifrostDependencyHandler = controllerDependencies.getBifrostDependencyHandler();
+        this.reconciler = new BifrostReconciler(controllerConfiguration, provisioningService, bifrostDependencyHandler, controllerDependencies.getBifrostSecretHandler(), controllerDependencies.getBifrostListenersHandler());
+        BifrostOperationGenerator<T, L> operationGenerator = new BifrostOperationGenerator(controllerConfiguration, controllerProperties, bifrostKubernetesApiManager, this.bifrostKubernetesApiProxy, bifrostDependencyHandler);
+        this.operationGeneratorThread = new Thread(operationGenerator);
+    }
+
+    void scanForOperations() {
+        try {
+            log.trace("Paging through all operations.");
+            String continueAt = null;
+
+            while(this.keepRunning()) {
+                String labelSelector = OperationUtils.getBaseSelector(this.controllerConfiguration);
+                V1ConfigMapList response = this.bifrostKubernetesApiProxy.listNamespacedConfigMap(this.coreV1Api, this.controllerProperties.getOperationNamespace(), labelSelector, this.controllerProperties.getOperationBatchSize(), continueAt);
+                continueAt = response.getMetadata().getContinue();
+                List<V1ConfigMap> operations = response.getItems();
+                if (!operations.isEmpty()) {
+                    this.processOperationBatch(operations);
+                }
+
+                if (!StringUtils.isNotBlank(continueAt)) {
+                    return;
+                }
+            }
+        } finally {
+            this.pause(this.controllerProperties.getOperationJobIntervalSeconds());
+        }
+
+    }
+
+    private void processOperationBatch(List<V1ConfigMap> operations) {
+        log.debug("Processing operations; count={}", operations.size());
+
+        for(V1ConfigMap operation : operations) {
+            if (!this.keepRunning()) {
+                return;
+            }
+
+            MDC.put("resource.name", OperationUtils.getResourceName(operation));
+
+            try {
+                BifrostOperationState operationState = new BifrostOperationState();
+                this.evaluateOperationQueuePosition(operation, operationState);
+                if (operationState.getReadiness() == Readiness.READY_FOR_PROCESSING) {
+                    this.processOperation(operation, operationState);
+                }
+
+                if (operationState.isTerminalState()) {
+                    this.deleteOperation(operation);
+                } else {
+                    operationState.getDeterminedType().ifPresent((s) -> this.setOperationType(operation, s));
+                }
+            } catch (Exception e) {
+                log.error("Error processing resource", e);
+            } finally {
+                MDC.remove("resource.name");
+            }
+        }
+
+    }
+
+    private void evaluateOperationQueuePosition(V1ConfigMap operation, BifrostOperationState operationState) {
+        String labelSelector = OperationUtils.getResourceSelector(this.controllerConfiguration, OperationUtils.getResourceNamespace(operation), OperationUtils.getResourceName(operation));
+        V1ConfigMapList response = this.bifrostKubernetesApiProxy.listNamespacedConfigMap(this.coreV1Api, this.controllerProperties.getOperationNamespace(), labelSelector, (Integer)null, (String)null);
+        List<V1ConfigMap> operations = new ArrayList(response.getItems());
+        operations.sort(Comparator.comparing(OperationUtils::getCreationTimestamp));
+        V1ConfigMap targetOperation = (V1ConfigMap)operations.stream().filter((o) -> OperationUtils.getOperationName(o).equals(OperationUtils.getOperationName(operation))).findFirst().orElse((Object)null);
+        if (targetOperation == null) {
+            log.error("Failed to find operation in subsequent lookup; metadata={}", operation.getMetadata());
+            operationState.setErrorType(ErrorType.RETRYABLE);
+        } else {
+            int index = operations.indexOf(targetOperation);
+            BifrostOperationState.Readiness var10000;
+            switch (index) {
+                case 0 -> var10000 = Readiness.READY_FOR_PROCESSING;
+                case 1 -> var10000 = Readiness.NOT_READY_FOR_PROCESSING;
+                default -> var10000 = Readiness.NOT_NEEDED;
+            }
+
+            BifrostOperationState.Readiness readiness = var10000;
+            operationState.setReadiness(readiness);
+        }
+    }
+
+    void processOperation(V1ConfigMap operation, BifrostOperationState operationState) {
+        String resourceNamespace = OperationUtils.getResourceNamespace(operation);
+        String resourceName = OperationUtils.getResourceName(operation);
+
+        Optional<T> maybeObject;
+        try {
+            maybeObject = this.bifrostKubernetesApiProxy.get(this.genericKubernetesApi, resourceNamespace, resourceName);
+        } catch (Exception e) {
+            log.error("Error getting latest resource", e);
+            operationState.setErrorType(ErrorType.RETRYABLE);
+            return;
+        }
+
+        if (maybeObject.isEmpty()) {
+            log.debug("Skipping resource that was no longer found in the cluster");
+            operationState.setPhase(Phase.COMPLETE);
+        } else {
+            T resourceInstance = (T)(maybeObject.get());
+            if (resourceInstance.getStatus() == null) {
+                resourceInstance.setStatus(new BifrostStatus());
+            }
+
+            BifrostStatus status = resourceInstance.getStatus();
+            BifrostFinalizerHandler.addFinalizer(resourceInstance, this.bifrostKubernetesApiProxy, this.genericKubernetesApi);
+            if (!this.isValidForThisControllerVersion(resourceInstance)) {
+                operationState.setPhase(Phase.COMPLETE);
+            } else {
+                String originalStatusJson = JsonUtils.objectToJson(status);
+                this.reconcileResource(resourceInstance, operationState);
+                String currentStatusJson = JsonUtils.objectToJson(status);
+                if (!currentStatusJson.equals(originalStatusJson)) {
+                    boolean saveSucceeded = this.saveStatus(resourceInstance);
+                    if (!saveSucceeded) {
+                        operationState.setErrorType(ErrorType.NOT_RETRYABLE);
+                    }
+                }
+
+                if (status.provisioningSucceeded() && status.getProvisioningAction() == BifrostProvisioningAction.DELETE) {
+                    BifrostFinalizerHandler.removeFinalizer(resourceInstance, this.bifrostKubernetesApiProxy, this.genericKubernetesApi);
+                }
+
+            }
+        }
+    }
+
+    private boolean isValidForThisControllerVersion(T resourceInstance) {
+        BifrostStatus status = resourceInstance.getStatus();
+        BifrostCondition controllerVersionCondition = status.getCondition("BifrostAPIVersion");
+        String controllerApiVersion = (String)controllerVersionCondition.getMetadata().getOrDefault("version", "");
+        boolean isValid = controllerApiVersion.isEmpty() ? this.controllerConfiguration.isLatest() : this.controllerConfiguration.getApiVersion().equals(controllerApiVersion);
+        if (!isValid) {
+            if (controllerApiVersion.isEmpty()) {
+                log.debug("Controller cannot manage this resource; a new resource will only be processed by a controller configured with 'latest: true'.");
+            } else {
+                log.debug("Controller cannot manage this resource; an old resource will only be processed by the version of the controller that provisioned it.");
+            }
+        }
+
+        return isValid;
+    }
+
+    private void reconcileResource(T resourceInstance, BifrostOperationState operationState) {
+        BifrostStatus status = resourceInstance.getStatus();
+        BifrostCondition provisioningCondition = status.getCondition("BifrostProvisioning");
+        if (!this.reconciler.processPrerequisites(resourceInstance, this.controllerProperties.isListenerAwareDelete())) {
+            log.debug("Waiting for resource dependencies to be complete.");
+            operationState.setPhase(Phase.IN_PROGRESS);
+        } else if (this.isEligibleToSkip(resourceInstance)) {
+            log.debug("Skipping resource as it has no updates.");
+            operationState.setPhase(Phase.COMPLETE);
+        } else {
+            if (!provisioningCondition.isInProgress()) {
+                BifrostCondition lastProvisionedCondition = status.getCondition("BifrostLastProvisioned");
+                boolean previouslyProvisioned = lastProvisionedCondition.getMetadata().get("lastSuccessfullyProvisionedTime") != null;
+                boolean deletedBeforeProvisioned = !previouslyProvisioned && resourceInstance.isBeingDeleted();
+                if (deletedBeforeProvisioned) {
+                    this.reconciler.cancel(resourceInstance);
+                } else if (resourceInstance.isBeingDeleted()) {
+                    this.reconciler.delete(resourceInstance);
+                } else if (previouslyProvisioned) {
+                    this.reconciler.update(resourceInstance);
+                } else {
+                    this.reconciler.create(resourceInstance);
+                }
+
+                operationState.setDeterminedType(status.getProvisioningAction());
+            }
+
+            this.reconciler.updateStatus(resourceInstance);
+            if (status.provisioningSucceeded() && status.getProvisioningAction() != BifrostProvisioningAction.DELETE) {
+                log.debug("Storing any outputs after successful resource provisioning.");
+                this.reconciler.storeOutputs(resourceInstance);
+                this.ensureResourceIsVersioned(resourceInstance);
+            }
+
+            if (status.provisioningIsComplete()) {
+                log.info("Provisioning is complete; status={}", status.getStatus());
+                operationState.setPhase(Phase.COMPLETE);
+            } else {
+                log.debug("Provisioning is in progress.");
+                operationState.setPhase(Phase.IN_PROGRESS);
+            }
+
+        }
+    }
+
+    private boolean isEligibleToSkip(T resourceInstance) {
+        if (resourceInstance.getStatus().provisioningInProgress()) {
+            return false;
+        } else if (resourceInstance.isBeingDeleted() && !BifrostFinalizerHandler.hasFinalizer(resourceInstance)) {
+            return true;
+        } else {
+            return !BifrostResourceHasher.hasHashChanged(resourceInstance);
+        }
+    }
+
+    void ensureResourceIsVersioned(T resourceInstance) {
+        BifrostCondition apiVersionCondition = resourceInstance.getStatus().getCondition("BifrostAPIVersion");
+        if (((String)apiVersionCondition.getMetadata().getOrDefault("version", "")).isEmpty()) {
+            apiVersionCondition.getMetadata().put("version", this.controllerConfiguration.getApiVersion());
+        }
+
+    }
+
+    private boolean saveStatus(T resourceInstance) {
+        log.debug("Saving resource status to Kubernetes");
+
+        try {
+            String patchJson = JsonUtils.objectToJson(Map.of("status", resourceInstance.getStatus()));
+            this.bifrostKubernetesApiProxy.patchStatus(this.customObjectsApi, this.controllerConfiguration.getApiGroup(), this.controllerConfiguration.getApiVersion(), this.controllerConfiguration.getResourcePlural(), resourceInstance.getMetadata().getNamespace(), resourceInstance.getMetadata().getName(), patchJson, "application/merge-patch+json");
+            return true;
+        } catch (Exception e) {
+            log.error("Failed to patch the resource status", e);
+            return false;
+        }
+    }
+
+    private void setOperationType(V1ConfigMap operation, String operationType) {
+        this.bifrostKubernetesApiProxy.patchNamespacedConfigMap(this.coreV1Api, OperationUtils.getOperationNamespace(operation), OperationUtils.getOperationName(operation), OperationUtils.createOperationTypePatch(operationType), "application/merge-patch+json");
+        log.debug("Determined operation type; operationType={}, operationName={}", operationType, OperationUtils.getOperationName(operation));
+    }
+
+    private void deleteOperation(V1ConfigMap operation) {
+        this.bifrostKubernetesApiProxy.deleteNamespacedConfigMap(this.coreV1Api, OperationUtils.getOperationNamespace(operation), OperationUtils.getOperationName(operation));
+        log.debug("Deleted operation; operationName={}", OperationUtils.getOperationName(operation));
+    }
+
+    void pause(int seconds) {
+        SleepUtils.pause(seconds, () -> !this.running);
+    }
+
+    public void run() {
+        log.info("**** Starting controller ****");
+        this.operationGeneratorThread.start();
+
+        while(this.keepRunning()) {
+            try {
+                this.scanForOperations();
+            } catch (Exception e) {
+                log.error("Error in controller watch occurred", e);
+            }
+        }
+
+    }
+
+    public void shutdown() {
+        this.shutDownOperationGenerator();
+        this.running = false;
+    }
+
+    private boolean keepRunning() {
+        if (Thread.currentThread().isInterrupted()) {
+            log.warn("Resource controller was terminated through an interrupt");
+            this.shutdown();
+        }
+
+        return this.running;
+    }
+
+    private void shutDownOperationGenerator() {
+        try {
+            if (this.operationGeneratorThread.isAlive()) {
+                this.operationGeneratorThread.interrupt();
+                boolean succeeded = this.operationGeneratorThread.join(Duration.ofSeconds(10L));
+                if (!succeeded) {
+                    log.warn("Timed out waiting for operation generator thread to shut down");
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error shutting down operation generator", e);
+        }
+
+    }
+
+    @Generated
+    public IBifrostControllerConfiguration<T, L> getControllerConfiguration() {
+        return this.controllerConfiguration;
+    }
+
+    @Generated
+    public BifrostControllerProperties getControllerProperties() {
+        return this.controllerProperties;
+    }
+
+    @Generated
+    public boolean isRunning() {
+        return this.running;
+    }
+}
